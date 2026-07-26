@@ -1,0 +1,29 @@
+# Secrets — never commit
+.env
+*.env
+!.env.example
+
+# Generated pipeline data (regenerable; may be large)
+data/
+*_job_history.csv
+*_job_postings.xlsx
+*_skills_analysis.xlsx
+*_skills_cache.json
+*_dashboard.html
+comparison_dashboard.html
+*_trend.png
+*_dashboard.png
+*_daily_report.log
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
