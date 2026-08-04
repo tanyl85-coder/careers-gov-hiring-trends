@@ -52,7 +52,7 @@ def section(title: str, body: str) -> str:
 
 def render_kpis(k: dict) -> str:
     items = [(k["active"], "Active Postings", ACCENT), (k["tracked"], "Tracked", ACCENT2),
-             (k["distinctSkills"], "Distinct Skills", ACCENT), (k["divisions"], "Divisions", ACCENT2),
+             (k.get("coreSkills", k["distinctSkills"]), "Core Skills", ACCENT), (k["divisions"], "Divisions", ACCENT2),
              (k["closingSoon"], "Closing In 7 Days", GOLD)]
     tds = "".join(
         f'<td align="center" style="padding:10px 4px">'
@@ -112,6 +112,31 @@ def render_heatmap(matrix: dict) -> str:
             f'{head}{"".join(trs)}</table>')
 
 
+def render_core_block(conc: dict) -> str:
+    if not conc.get("core"):
+        return f'<div style="color:{MUTED};font:12px {FONT}">Not enough analysed postings yet.</div>'
+    rows = []
+    for c in conc["core"][:12]:
+        pct = c["share"] * 100
+        rows.append(
+            f'<tr><td style="color:{TEXT};font:12px {FONT};padding:3px 8px 3px 0;white-space:nowrap">'
+            f'{esc(c["skill"])}</td>'
+            f'<td width="100%" style="padding:3px 0">'
+            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>'
+            f'<td width="{max(2, round(pct))}%" style="background:{ACCENT};height:13px;border-radius:4px;'
+            f'font-size:1px;line-height:1px">&nbsp;</td><td style="font-size:1px">&nbsp;</td>'
+            f'</tr></table></td>'
+            f'<td align="right" style="color:{MUTED};font:12px {FONT};padding-left:8px">{pct:.0f}%</td></tr>')
+    tail = conc["distinct"] - len(conc["core"])
+    note = (f'<div style="color:{MUTED};font:10px {FONT};padding-top:8px">'
+            f'{len(conc["core"])} skills appear in 10%+ of postings and carry the recurring demand '
+            f'signal. The remaining {tail} of {conc["distinct"]} distinct skills appear rarely - a mix '
+            f'of niche tools and one-off phrasings - so &ldquo;distinct skills&rdquo; measures '
+            f'vocabulary breadth, not demand.</div>')
+    return (f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0">'
+            f'{"".join(rows)}</table>{note}')
+
+
 def render_email_html(payload: dict, title: str, intro_html: str, footer_html: str,
                       trend_cid: str | None) -> str:
     two_col = (
@@ -120,8 +145,8 @@ def render_email_html(payload: dict, title: str, intro_html: str, footer_html: s
         + section("Skill Category Demand",
                   render_bars(payload["categories"], "category", "count", ACCENT, 13))
         + '</td><td valign="top" width="50%" style="padding-left:7px">'
-        + section("Top Skills",
-                  render_bars(payload["topSkills"], "skill", "count", ACCENT2, 13))
+        + section("Core Skills &nbsp;&middot;&nbsp; share of postings",
+                  render_core_block(payload.get("concentration", {})))
         + "</td></tr></table>")
     two_col2 = (
         f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>'

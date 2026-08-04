@@ -23,6 +23,7 @@ import argparse
 import base64
 import html
 import json
+import math
 import os
 import smtplib
 import sys
@@ -118,6 +119,9 @@ def load_agency(workdir: Path, prefix: str, name: str, now: datetime) -> dict:
         keys = frozenset(skill_key(s["skill"]) for s in entry.get("skills", []))
         windows.append((start, end, keys))
 
+    core_thr = max(3, math.ceil(0.10 * analyzed)) if analyzed else 0
+    core_n = sum(1 for v in skill_counts.values() if core_thr and v >= core_thr)
+
     return {
         "name": name,
         "prefix": prefix,
@@ -125,6 +129,7 @@ def load_agency(workdir: Path, prefix: str, name: str, now: datetime) -> dict:
         "active": int(active),
         "analyzed": analyzed,
         "distinct_skills": len(skill_counts),
+        "core_skills": core_n,
         "cat_counts": cat_counts,
         "top_skills": [(skill_display.get(k, k), v) for k, v in skill_counts.most_common(10)],
         "skill_display": skill_display,
@@ -288,7 +293,8 @@ def render_kpi_table(agencies: list[dict]) -> str:
         for i, a in enumerate(agencies)) + "</tr>")
     rows = []
     for label, key in [("Active postings", "active"), ("Postings tracked", "tracked"),
-                       ("Analyzed", "analyzed"), ("Distinct skills", "distinct_skills")]:
+                       ("Analyzed", "analyzed"), ("Core skills (10%+ of postings)", "core_skills"),
+                       ("Distinct skills (incl. one-offs)", "distinct_skills")]:
         tds = "".join(f'<td align="center" style="color:{TEXT};font:600 16px {FONT};padding:6px">{a[key]}</td>'
                       for a in agencies)
         rows.append(f'<tr><td style="color:{MUTED};font:12px {FONT};padding:6px 8px 6px 0">{label}</td>{tds}</tr>')

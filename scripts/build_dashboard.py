@@ -17,6 +17,7 @@ Usage:
 import argparse
 import html
 import json
+import math
 import os
 import sys
 from collections import Counter, defaultdict
@@ -97,6 +98,33 @@ def build_weekly_trend(postings: list[dict], now: datetime, num_weeks: int = 12,
     }
 
 
+def build_concentration(skill_counts: Counter, skill_display: dict, n_analyzed: int) -> dict:
+    """Split the skill vocabulary into the recurring core and the long tail.
+
+    Most distinct skills are named in a single posting - a mix of genuinely
+    niche tools and one-off phrasings of common ideas. Counting them together
+    makes "distinct skills" look like breadth of demand when it mostly measures
+    how verbosely JDs are written, so the two are reported separately.
+    """
+    if not n_analyzed:
+        return {"distinct": 0, "core": [], "buckets": [], "threshold": 0}
+    thr = max(3, math.ceil(0.10 * n_analyzed))
+    core = [{"skill": skill_display.get(k, k), "count": v, "share": v / n_analyzed}
+            for k, v in skill_counts.most_common() if v >= thr]
+    buckets = [
+        {"label": f"Core - in {thr}+ postings (10%+)", "count": len(core)},
+        {"label": f"Recurring - 3 to {thr - 1} postings",
+         "count": sum(1 for v in skill_counts.values() if 3 <= v < thr)},
+        {"label": "Occasional - 2 postings",
+         "count": sum(1 for v in skill_counts.values() if v == 2)},
+        {"label": "One-off - 1 posting",
+         "count": sum(1 for v in skill_counts.values() if v == 1)},
+    ]
+    return {"distinct": len(skill_counts), "core": core,
+            "buckets": [b for b in buckets if b["count"] or b["label"].startswith("Core")],
+            "threshold": thr}
+
+
 def build_payload(history_df: pd.DataFrame, cache: dict) -> dict:
     now = datetime.now(tz=timezone.utc)
     today_str = now.strftime("%Y-%m-%d")
@@ -154,6 +182,8 @@ def build_payload(history_df: pd.DataFrame, cache: dict) -> dict:
     top_skills = [{"skill": skill_display.get(k, k), "category": skill_cat[k], "count": v}
                   for k, v in skill_counts.most_common(20)]
 
+    concentration = build_concentration(skill_counts, skill_display, len(analyzed))
+
     div_counts = Counter(p["division"] for p in analyzed)
     top_divisions = [d for d, _ in div_counts.most_common(10)]
     matrix_cats = [c for c, _ in cat_counts.most_common(8)]
@@ -183,9 +213,11 @@ def build_payload(history_df: pd.DataFrame, cache: dict) -> dict:
             "tracked": len(postings),
             "analyzed": len(analyzed),
             "distinctSkills": len(skill_counts),
+            "coreSkills": len(concentration["core"]),
             "divisions": len(div_counts),
             "closingSoon": len(seven_days),
         },
+        "concentration": concentration,
         "categories": [{"category": c, "count": v} for c, v in cat_counts.most_common()],
         "topSkills": top_skills,
         "divisions": [{"division": d, "count": div_counts[d]} for d in top_divisions],
@@ -200,7 +232,7 @@ def build_payload(history_df: pd.DataFrame, cache: dict) -> dict:
 
 def render_kpis(kpis: dict) -> str:
     defs = [("active", "Active Postings", ""), ("tracked", "Postings Tracked", " alt"),
-            ("distinctSkills", "Distinct Skills", ""), ("divisions", "Divisions Hiring", " alt"),
+            ("coreSkills", "Core Skills", ""), ("divisions", "Divisions Hiring", " alt"),
             ("closingSoon", "Closing In 7 Days", " warn")]
     out = []
     for key, label, mod in defs:
@@ -264,6 +296,38 @@ def render_trend(trend: dict) -> str:
     svg = (f'<svg class="trendsvg" viewBox="0 0 {W} {H}" width="100%" height="240" '
            f'preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">{"".join(parts)}</svg>')
     return f'<div class="legend">{legend}</div>{svg}'
+
+
+def render_concentration(conc: dict) -> str:
+    if not conc["core"]:
+        return '<div class="sub">Not enough analysed postings yet.</div>'
+    rows = []
+    for b in conc["buckets"]:
+        pct = b["count"] / conc["distinct"] if conc["distinct"] else 0
+        rows.append(
+            f'<div class="bar-row"><div class="name">{esc(b["label"])}</div>'
+            f'<div class="track"><div class="fill" style="width:{max(2, pct * 100):.1f}%"></div></div>'
+            f'<div class="num">{b["count"]}</div></div>')
+    tail = sum(b["count"] for b in conc["buckets"] if b["label"].startswith(("Occasional", "One-off")))
+    note = (f'<div class="sub" style="margin-top:10px">'
+            f'{len(conc["core"])} core skills carry the recurring demand signal. '
+            f'The other {conc["distinct"] - len(conc["core"])} of {conc["distinct"]} distinct skills '
+            f'appear rarely &mdash; {tail} in only one or two postings &mdash; a mix of genuinely niche '
+            f'tools and one-off phrasings, so treat &ldquo;distinct skills&rdquo; as vocabulary breadth '
+            f'rather than demand.</div>')
+    return "".join(rows) + note
+
+
+def render_core_skills(conc: dict) -> str:
+    if not conc["core"]:
+        return '<div class="sub">Not enough analysed postings yet.</div>'
+    rows = []
+    for c in conc["core"][:16]:
+        rows.append(
+            f'<div class="bar-row"><div class="name">{esc(c["skill"])}</div>'
+            f'<div class="track"><div class="fill" style="width:{c["share"] * 100:.1f}%"></div></div>'
+            f'<div class="num">{c["share"] * 100:.0f}%</div></div>')
+    return "".join(rows)
 
 
 def render_monthly(monthly: list[dict]) -> str:
@@ -366,6 +430,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <div class="card span12"><h2>Weekly Skills Demand Trend <span class="pill">postings open each week, top 6 categories</span></h2>{trend}</div>
   <div class="card span6"><h2>Skill Category Demand <span class="pill">distinct postings</span></h2>{cats}</div>
   <div class="card span6"><h2>Top Skills <span class="pill">top 20</span></h2><div style="max-height:420px;overflow-y:auto">{skills}</div></div>
+  <div class="card span6"><h2>Core Skills <span class="pill">share of postings</span></h2>{core}</div>
+  <div class="card span6"><h2>Skill Concentration <span class="pill">core vs tail</span></h2>{concentration}</div>
   <div class="card span4"><h2>Postings by Division <span class="pill">top 10</span></h2>{divs}</div>
   <div class="card span4"><h2>Job Level Mix</h2>{levels}</div>
   <div class="card span4"><h2>Monthly Posting Volume</h2>{monthly}</div>
@@ -389,6 +455,8 @@ def render_html(payload: dict, title: str) -> str:
         divs=render_bars(payload["divisions"], "division", "count"),
         levels=render_bars(payload["levels"], "band", "count"),
         monthly=render_monthly(payload["monthly"]),
+        core=render_core_skills(payload["concentration"]),
+        concentration=render_concentration(payload["concentration"]),
         heatmap=render_heatmap(payload["matrix"]),
     )
 
