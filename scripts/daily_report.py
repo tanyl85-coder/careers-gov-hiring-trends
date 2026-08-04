@@ -27,10 +27,12 @@ Usage:
 """
 
 import argparse
+import errno
 import os
 import smtplib
 import subprocess
 import sys
+import time
 from datetime import datetime
 from email.message import EmailMessage
 from pathlib import Path
@@ -200,7 +202,48 @@ class Pipeline:
         self.log("Email sent.")
         return True
 
+    def acquire_lock(self):
+        """Exclusive per-agency lock. Windows Task Scheduler fires every missed
+        run at once after the PC has been off, so an agency's crawl task and its
+        report task can otherwise start seconds apart and fight over the same
+        history/cache files. Second arrival exits quietly instead."""
+        lock_path = self.workdir / f".{self.prefix}_pipeline.lock"
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except OSError as e:
+            if e.errno != errno.EEXIST:
+                raise
+            # Stale lock (>2h) means a previous run died; take it over.
+            try:
+                age = time.time() - os.path.getmtime(lock_path)
+            except OSError:
+                age = 0
+            if age > 7200:
+                self.log(f"Removing stale lock ({age/3600:.1f}h old).")
+                try:
+                    os.unlink(lock_path)
+                except OSError:
+                    pass
+                return self.acquire_lock()
+            return None
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        return lock_path
+
     def run(self, send_email: bool) -> int:
+        lock_path = self.acquire_lock()
+        if lock_path is None:
+            self.log(f"SKIPPED: another {self.agency_name} pipeline run is already in progress.")
+            return 0
+        try:
+            return self._run(send_email)
+        finally:
+            try:
+                os.unlink(lock_path)
+            except OSError:
+                pass
+
+    def _run(self, send_email: bool) -> int:
         py = sys.executable
         self.log(f"=== Daily {self.agency_name} report run started ===")
 
