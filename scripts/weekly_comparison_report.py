@@ -49,6 +49,7 @@ PANEL = "#131a30"
 TEXT = "#e8ecf6"
 MUTED = "#8b96b3"
 ACCENT = "#5eead4"
+ROSE = "#fb7185"
 CELL_BG = "#0e1428"
 LINE = "#232e4d"
 FONT = "'Segoe UI',system-ui,Arial,sans-serif"
@@ -102,7 +103,8 @@ def load_agency(workdir: Path, prefix: str, name: str, now: datetime) -> dict:
     skill_display = resolve_displays(raw_counter)
 
     # Weekly open-postings series: a posting counts toward each week its
-    # posted -> (closing | last-seen | now) window overlaps.
+    # posted -> (closing | last-seen | now) window overlaps. Each window also
+    # carries the posting's skill keys so skill demand can be sliced by week.
     windows = []
     for _, row in history.iterrows():
         start = parse_date(row.get("Date Posted"))
@@ -112,7 +114,9 @@ def load_agency(workdir: Path, prefix: str, name: str, now: datetime) -> dict:
         if not end:
             last_seen = str(row.get("Last Seen", ""))
             end = now if last_seen == latest_seen else (parse_date(last_seen) or now)
-        windows.append((start, end))
+        entry = cache.get(str(row["Job ID"]), {})
+        keys = frozenset(skill_key(s["skill"]) for s in entry.get("skills", []))
+        windows.append((start, end, keys))
 
     return {
         "name": name,
@@ -123,6 +127,7 @@ def load_agency(workdir: Path, prefix: str, name: str, now: datetime) -> dict:
         "distinct_skills": len(skill_counts),
         "cat_counts": cat_counts,
         "top_skills": [(skill_display.get(k, k), v) for k, v in skill_counts.most_common(10)],
+        "skill_display": skill_display,
         "band_counts": band_counts,
         "windows": windows,
     }
@@ -137,7 +142,7 @@ def weekly_series(agencies: list[dict], now: datetime, num_weeks: int = 12):
         vals = []
         for wk in weeks:
             wk_end = wk + timedelta(days=7)
-            vals.append(sum(1 for start, end in a["windows"] if start < wk_end and end >= wk))
+            vals.append(sum(1 for start, end, _ in a["windows"] if start < wk_end and end >= wk))
         series.append({"name": a["name"], "values": vals})
     # Trim leading all-zero weeks
     while labels and all(s["values"][0] == 0 for s in series):
@@ -166,6 +171,107 @@ def render_trend_png(labels, series, output: Path):
     fig.subplots_adjust(left=0.05, right=0.99, top=0.96, bottom=0.13)
     fig.savefig(output, facecolor=BG)
     plt.close(fig)
+
+
+def skills_shift(agency: dict, now: datetime, weeks_back: int = 2, top_n: int = 4,
+                 min_postings: int = 5) -> dict:
+    """Week-over-week movement in skill demand for one agency.
+
+    Compares the share of currently-open postings requiring each skill against
+    the share `weeks_back` weeks ago. Share (not raw count) is used so a change
+    reflects a genuine shift in what is being asked for, rather than the book
+    simply growing or shrinking.
+    """
+    this_monday = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    past_monday = this_monday - timedelta(weeks=weeks_back)
+
+    def slice_week(wk_start):
+        wk_end = wk_start + timedelta(days=7)
+        open_now = [keys for start, end, keys in agency["windows"]
+                    if start < wk_end and end >= wk_start]
+        counts = Counter()
+        for keys in open_now:
+            counts.update(keys)
+        return len(open_now), counts
+
+    n_now, c_now = slice_week(this_monday)
+    n_past, c_past = slice_week(past_monday)
+
+    if n_now < min_postings or n_past < min_postings:
+        return {"ok": False, "n_now": n_now, "n_past": n_past,
+                "weeks_back": weeks_back, "risers": [], "fallers": []}
+
+    deltas = []
+    for key in set(c_now) | set(c_past):
+        cn, cp = c_now.get(key, 0), c_past.get(key, 0)
+        # Ignore skills that are rare in both periods - their swings are noise.
+        if cn < 3 and cp < 3:
+            continue
+        deltas.append({
+            "key": key,
+            "name": agency["skill_display"].get(key, key),
+            "now": cn / n_now, "past": cp / n_past,
+            "delta": cn / n_now - cp / n_past,
+            "n_now": cn, "n_past": cp,
+        })
+    deltas.sort(key=lambda d: d["delta"], reverse=True)
+
+    # A move must clear 3pp AND be backed by at least 2 postings. In a small
+    # book a single posting is worth several pp, so a share threshold alone
+    # would dress up one req as a hiring trend.
+    def material(d):
+        return abs(d["delta"]) >= 0.03 and abs(d["n_now"] - d["n_past"]) >= 2
+
+    risers = [d for d in deltas if d["delta"] > 0 and material(d)][:top_n]
+    fallers = [d for d in deltas if d["delta"] < 0 and material(d)][-top_n:][::-1]
+    return {"ok": True, "n_now": n_now, "n_past": n_past,
+            "weeks_back": weeks_back, "risers": risers, "fallers": fallers}
+
+
+def render_skills_shift(agencies: list[dict], now: datetime) -> str:
+    cols = []
+    width = 100 // max(len(agencies), 1)
+    for i, a in enumerate(agencies):
+        sh = skills_shift(a, now)
+        if not sh["ok"]:
+            body = (f'<div style="color:{MUTED};font:11px {FONT}">Not enough comparable '
+                    f'history yet ({sh["n_now"]} open now vs {sh["n_past"]} then).</div>')
+        else:
+            rows = []
+            for d in sh["risers"]:
+                rows.append(
+                    f'<tr><td style="color:{ACCENT};font:11px {FONT};padding:2px 4px 2px 0">&#9650;</td>'
+                    f'<td style="color:{TEXT};font:11px {FONT};padding:2px 6px 2px 0">{esc(d["name"])}</td>'
+                    f'<td align="right" style="color:{ACCENT};font:600 11px {FONT}">'
+                    f'+{d["delta"]*100:.0f}pp</td>'
+                    f'<td align="right" style="color:{MUTED};font:10px {FONT};padding-left:6px">'
+                    f'{d["past"]*100:.0f}&#8594;{d["now"]*100:.0f}%</td></tr>')
+            for d in sh["fallers"]:
+                rows.append(
+                    f'<tr><td style="color:{ROSE};font:11px {FONT};padding:2px 4px 2px 0">&#9660;</td>'
+                    f'<td style="color:{TEXT};font:11px {FONT};padding:2px 6px 2px 0">{esc(d["name"])}</td>'
+                    f'<td align="right" style="color:{ROSE};font:600 11px {FONT}">'
+                    f'{d["delta"]*100:.0f}pp</td>'
+                    f'<td align="right" style="color:{MUTED};font:10px {FONT};padding-left:6px">'
+                    f'{d["past"]*100:.0f}&#8594;{d["now"]*100:.0f}%</td></tr>')
+            if not rows:
+                rows.append(f'<tr><td colspan="4" style="color:{MUTED};font:11px {FONT}">'
+                            f'Skills mix stable &#8212; no move cleared 3pp.</td></tr>')
+            body = (f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0">'
+                    f'{"".join(rows)}</table>'
+                    f'<div style="color:{MUTED};font:10px {FONT};padding-top:6px">'
+                    f'{sh["n_past"]} &#8594; {sh["n_now"]} open postings</div>')
+        cols.append(
+            f'<td valign="top" width="{width}%" style="padding:0 6px">'
+            f'<div style="color:{PALETTE[i]};font:700 13px {FONT};padding-bottom:6px">{esc(a["name"])}</div>'
+            f'{body}</td>')
+    note = (f'<div style="color:{MUTED};font:10px {FONT};padding-top:10px">'
+            f'Change in the share of an agency&#39;s open postings requiring each skill, '
+            f'this week vs 2 weeks ago (pp = percentage points). Share is used so growth in '
+            f'the overall book does not read as a skills shift. A move must clear 3pp and be '
+            f'backed by at least 2 postings, so single-req noise is filtered out.</div>')
+    return (f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0">'
+            f'<tr>{"".join(cols)}</tr></table>{note}')
 
 
 def section(title: str, body: str) -> str:
@@ -253,7 +359,9 @@ def render_level_matrix(agencies: list[dict]) -> str:
     return (f'<table role="presentation" width="100%" cellpadding="0" cellspacing="2">{head}{"".join(rows)}</table>')
 
 
-def render_comparison_html(agencies: list[dict], trend_src: str, generated: str) -> str:
+def render_comparison_html(agencies: list[dict], trend_src: str, generated: str,
+                           now: datetime | None = None) -> str:
+    now = now or datetime.now(tz=timezone.utc)
     trend_block = section(
         "Weekly Open Postings Trend",
         f'<img src="{trend_src}" alt="Weekly open postings per agency" width="100%" '
@@ -270,6 +378,7 @@ def render_comparison_html(agencies: list[dict], trend_src: str, generated: str)
         f'</td></tr>'
         f'<tr><td>{section("Headline Numbers", render_kpi_table(agencies))}</td></tr>'
         f'<tr><td>{trend_block}</td></tr>'
+        f'<tr><td>{section("Key Skills Shift &nbsp;&middot;&nbsp; this week vs 2 weeks ago", render_skills_shift(agencies, now))}</td></tr>'
         f'<tr><td>{section("Skill Category Demand &nbsp;&middot;&nbsp; share of each agency&#39;s postings", render_category_matrix(agencies))}</td></tr>'
         f'<tr><td>{section("Top 10 Skills per Agency &nbsp;&middot;&nbsp; distinct postings", render_top_skills_columns(agencies))}</td></tr>'
         f'<tr><td>{section("Job Level Mix &nbsp;&middot;&nbsp; share of analyzed postings", render_level_matrix(agencies))}</td></tr>'
@@ -342,13 +451,13 @@ def main() -> int:
     generated = now.strftime("%d %b %Y, %H:%M UTC")
     # Standalone file: trend embedded as data URI so the file is self-contained
     b64 = base64.b64encode(trend_png.read_bytes()).decode()
-    file_html = render_comparison_html(agencies, f"data:image/png;base64,{b64}", generated)
+    file_html = render_comparison_html(agencies, f"data:image/png;base64,{b64}", generated, now)
     dashboard_file = workdir / "comparison_dashboard.html"
     dashboard_file.write_text(file_html, encoding="utf-8")
     print(f"Wrote {dashboard_file} ({len(agencies)} agencies)")
 
     if not args.no_email:
-        email_html = render_comparison_html(agencies, "cid:comparisontrend", generated)
+        email_html = render_comparison_html(agencies, "cid:comparisontrend", generated, now)
         send_email(email_html, trend_png, dashboard_file, [a["name"] for a in agencies])
     return 0
 
