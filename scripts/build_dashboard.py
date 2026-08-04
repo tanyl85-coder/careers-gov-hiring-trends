@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
+from division_normalize import resolve_divisions
 from skill_normalize import resolve_displays, skill_key
 
 DEFAULT_HISTORY_FILE = "htx_job_history.csv"
@@ -136,6 +137,13 @@ def build_payload(history_df: pd.DataFrame, cache: dict) -> dict:
     last_seen_col = history_df["Last Seen"] if "Last Seen" in history_df.columns else None
     latest_seen = last_seen_col.max() if last_seen_col is not None else ""
 
+    # Job titles name the org unit at inconsistent depth ("xCDI" vs
+    # "Mobile Core & Transmission, xCDI"), so fold the variants together before
+    # counting - otherwise one division is counted as several.
+    div_display = resolve_divisions(
+        Counter(cache.get(str(j), {}).get("division", "Unspecified")
+                for j in history_df["Job ID"].astype(str)))
+
     postings = []
     for _, row in history_df.iterrows():
         jid = str(row["Job ID"])
@@ -151,7 +159,7 @@ def build_payload(history_df: pd.DataFrame, cache: dict) -> dict:
             "posted": str(row.get("Date Posted", "")),
             "closing": closing,
             "month": month_bucket(str(row.get("Date Posted", ""))),
-            "division": entry.get("division", "Unspecified"),
+            "division": div_display.get(entry.get("division", "Unspecified"), "Unspecified"),
             "band": entry.get("job_level_band", "Unspecified"),
             # No closing date = open-until-filled = active
             "active": is_active,
@@ -214,7 +222,7 @@ def build_payload(history_df: pd.DataFrame, cache: dict) -> dict:
             "analyzed": len(analyzed),
             "distinctSkills": len(skill_counts),
             "coreSkills": len(concentration["core"]),
-            "divisions": len(div_counts),
+            "divisions": sum(1 for v in div_counts.values() if v >= 2),
             "closingSoon": len(seven_days),
         },
         "concentration": concentration,
@@ -232,7 +240,7 @@ def build_payload(history_df: pd.DataFrame, cache: dict) -> dict:
 
 def render_kpis(kpis: dict) -> str:
     defs = [("active", "Active Postings", ""), ("tracked", "Postings Tracked", " alt"),
-            ("coreSkills", "Core Skills", ""), ("divisions", "Divisions Hiring", " alt"),
+            ("coreSkills", "Core Skills", ""), ("divisions", "Divisions, 2+ Roles", " alt"),
             ("closingSoon", "Closing In 7 Days", " warn")]
     out = []
     for key, label, mod in defs:

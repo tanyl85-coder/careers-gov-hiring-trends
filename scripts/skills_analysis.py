@@ -34,6 +34,7 @@ import anthropic
 import pandas as pd
 from dotenv import load_dotenv
 
+from division_normalize import resolve_divisions
 from skill_normalize import resolve_displays, skill_key
 
 load_dotenv()
@@ -202,6 +203,9 @@ def build_skills_detail(history_df: pd.DataFrame, cache: dict) -> pd.DataFrame:
         for s in cache.get(jid, {}).get("skills", []):
             raw_counter[s["skill"].strip()] += 1
     display_map = resolve_displays(raw_counter)
+    div_map = resolve_divisions(
+        Counter(cache.get(str(j), {}).get("division", "Unspecified")
+                for j in history_df["Job ID"].astype(str)))
 
     rows = []
     for _, row in history_df.iterrows():
@@ -215,7 +219,7 @@ def build_skills_detail(history_df: pd.DataFrame, cache: dict) -> pd.DataFrame:
                 "Job Title": row["Job Title"],
                 "Date Posted": row.get("Date Posted", ""),
                 "Month": month_bucket(row.get("Date Posted", "")),
-                "Division": entry.get("division", "Unspecified"),
+                "Division": div_map.get(entry.get("division", "Unspecified"), "Unspecified"),
                 "Job Level (Raw)": entry.get("job_level_raw", "Unspecified"),
                 "Job Level Band": entry.get("job_level_band", "Unspecified"),
                 "Skill": display_map.get(skill_key(s["skill"]), s["skill"].strip()),
@@ -386,7 +390,11 @@ def main():
 
     postings_view = history_df.copy()
     jid_series = postings_view["Job ID"].astype(str)
-    postings_view.insert(7, "Division", jid_series.map(lambda j: cache.get(j, {}).get("division", "")))
+    _div_map = resolve_divisions(
+        Counter(cache.get(str(j), {}).get("division", "Unspecified")
+                for j in history_df["Job ID"].astype(str)))
+    postings_view.insert(7, "Division", jid_series.map(
+        lambda j: _div_map.get(cache.get(j, {}).get("division", ""), cache.get(j, {}).get("division", ""))))
     postings_view.insert(8, "Job Level (Raw)", jid_series.map(lambda j: cache.get(j, {}).get("job_level_raw", "")))
     postings_view.insert(9, "Job Level Band", jid_series.map(lambda j: cache.get(j, {}).get("job_level_band", "")))
     postings_view["Extracted Skills"] = jid_series.map(
