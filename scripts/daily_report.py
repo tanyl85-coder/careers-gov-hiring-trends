@@ -45,6 +45,29 @@ SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 465
 
 
+def _pid_alive(pid: int) -> bool:
+    """Is a process with this pid still running? Used to tell a live run from
+    a lock left behind by one that was killed."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION, STILL_ACTIVE = 0x1000, 259
+        k32 = ctypes.windll.kernel32
+        handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        code = ctypes.c_ulong()
+        ok = k32.GetExitCodeProcess(handle, ctypes.byref(code))
+        k32.CloseHandle(handle)
+        return bool(ok) and code.value == STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
 class Pipeline:
     def __init__(self, workdir: Path, agency: str, agency_name: str, prefix: str):
         self.workdir = workdir
@@ -202,29 +225,41 @@ class Pipeline:
         self.log("Email sent.")
         return True
 
-    def acquire_lock(self):
+    def acquire_lock(self, _retry: bool = True):
         """Exclusive per-agency lock. Windows Task Scheduler fires every missed
         run at once after the PC has been off, so an agency's crawl task and its
         report task can otherwise start seconds apart and fight over the same
-        history/cache files. Second arrival exits quietly instead."""
+        history/cache files. Second arrival exits quietly instead.
+
+        A run killed outright (Task Scheduler terminates processes at wake with
+        0xC000013A) never reaches its cleanup, so the lock must be reclaimable:
+        the owning PID is checked for liveness, with an age cap as backstop.
+        Without that, one killed run silently blocks every later run.
+        """
         lock_path = self.workdir / f".{self.prefix}_pipeline.lock"
         try:
             fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except OSError as e:
             if e.errno != errno.EEXIST:
                 raise
-            # Stale lock (>2h) means a previous run died; take it over.
+            try:
+                owner = int(open(lock_path).read().strip() or 0)
+            except (OSError, ValueError):
+                owner = 0
             try:
                 age = time.time() - os.path.getmtime(lock_path)
             except OSError:
                 age = 0
-            if age > 7200:
-                self.log(f"Removing stale lock ({age/3600:.1f}h old).")
+
+            dead = owner and not _pid_alive(owner)
+            if (dead or age > 7200) and _retry:
+                why = f"owner pid {owner} is gone" if dead else f"{age / 3600:.1f}h old"
+                self.log(f"Reclaiming stale lock ({why}).")
                 try:
                     os.unlink(lock_path)
                 except OSError:
                     pass
-                return self.acquire_lock()
+                return self.acquire_lock(_retry=False)
             return None
         os.write(fd, str(os.getpid()).encode())
         os.close(fd)
